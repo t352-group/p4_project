@@ -24,13 +24,31 @@ jobs:
     runs-on: ubuntu-latest
     env:
       REPO: 0xSoul24/kernel_google_msm-4.14
-      KERNEL_DIR: ${{ github.workspace }}
+      KERNEL_DIR: ${{ github.workspace }}/kernel
+      SCRIPTS_DIR: ${{ github.workspace }}/scripts
       OUTDIR: ${{ github.workspace }}/out
       NDK_VERSION: 'r25c'
     steps:
-    - name: Checkout kernel repo
+    - name: Checkout scripts repository
       uses: actions/checkout@v4
       with:
+        path: scripts_repo
+        
+    - name: Copy scripts to workspace
+      run: |
+        mkdir -p scripts
+        if [ -d scripts_repo/scripts ]; then
+          cp -r scripts_repo/scripts/* scripts/
+          chmod +x scripts/*.py scripts/*.sh
+        fi
+        ls -la scripts/
+      shell: bash
+    
+    - name: Checkout kernel source
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ env.REPO }}
+        path: kernel
         fetch-depth: 0
 
     - name: Install dependencies
@@ -94,24 +112,24 @@ jobs:
     - name: Unpack boot image (minimal)
       run: |
         mkdir -p $OUTDIR/unpacked
-        python3 ./scripts/unpack_bootimg.py --input $OUTDIR/boot.img --outdir $OUTDIR/unpacked
+        python3 $SCRIPTS_DIR/unpack_bootimg.py --input $OUTDIR/boot.img --outdir $OUTDIR/unpacked
         ls -la $OUTDIR/unpacked
       shell: bash
 
     - name: Extract kernel config (best-effort)
       run: |
         # Attempt to use kernel script/extractor if present; fallback to placeholder
-        if [ -f scripts/extract-ikconfig ]; then
-          scripts/extract-ikconfig $OUTDIR/unpacked/* > $OUTDIR/.config || true
+        if [ -f $KERNEL_DIR/scripts/extract-ikconfig ]; then
+          $KERNEL_DIR/scripts/extract-ikconfig $OUTDIR/unpacked/* > $OUTDIR/.config || true
         else
-          python3 ./scripts/extract_ikconfig.py $OUTDIR/unpacked/* > $OUTDIR/.config || true
+          python3 $SCRIPTS_DIR/extract_ikconfig.py $OUTDIR/unpacked/* > $OUTDIR/.config || true
         fi
         if [ ! -s $OUTDIR/.config ]; then
           echo "No IKCONFIG found; falling back to device defconfig if present"
-          if [ -f arch/arm64/configs/flame_defconfig ]; then
-            cp arch/arm64/configs/flame_defconfig $OUTDIR/.config
-          elif [ -f arch/arm64/configs/flame-perf_defconfig ]; then
-            cp arch/arm64/configs/flame-perf_defconfig $OUTDIR/.config
+          if [ -f $KERNEL_DIR/arch/arm64/configs/flame_defconfig ]; then
+            cp $KERNEL_DIR/arch/arm64/configs/flame_defconfig $OUTDIR/.config
+          elif [ -f $KERNEL_DIR/arch/arm64/configs/flame-perf_defconfig ]; then
+            cp $KERNEL_DIR/arch/arm64/configs/flame-perf_defconfig $OUTDIR/.config
           else
             echo "# fallback minimal config" > $OUTDIR/.config
           fi
@@ -122,10 +140,12 @@ jobs:
     - name: Apply KernelSU-next and susfs patches (attempt)
       run: |
         set -e
+        cd $KERNEL_DIR
+        
         # Attempt to apply KernelSU patches if present in kernelsu-next/patches or kernelsu-next/patch
-        if [ -d kernelsu-next/patches ]; then
+        if [ -d ${{ github.workspace }}/kernelsu-next/patches ]; then
           echo "Applying KernelSU patches from kernelsu-next/patches..."
-          for p in kernelsu-next/patches/*.patch; do
+          for p in ${{ github.workspace }}/kernelsu-next/patches/*.patch; do
             [ -e "$p" ] || continue
             echo "Applying $p"
             git apply --reject --whitespace=fix "$p" || ( echo "kernelsu patch failed: $p" && exit 5 )
@@ -135,12 +155,12 @@ jobs:
         fi
 
         # Apply susfs patch if provided in susfs4ksu-module repository
-        if [ -f susfs4ksu-module/susfs.patch ]; then
+        if [ -f ${{ github.workspace }}/susfs4ksu-module/susfs.patch ]; then
           echo "Applying susfs4ksu-module/susfs.patch"
-          git apply --reject --whitespace=fix susfs4ksu-module/susfs.patch || ( echo "susfs patch failed" && exit 6 )
+          git apply --reject --whitespace=fix ${{ github.workspace }}/susfs4ksu-module/susfs.patch || ( echo "susfs patch failed" && exit 6 )
         else
           echo "No susfs.patch found in susfs4ksu-module; checking for patch files..."
-          for p in susfs4ksu-module/*.patch; do
+          for p in ${{ github.workspace }}/susfs4ksu-module/*.patch; do
             [ -e "$p" ] || continue
             echo "Applying $p"
             git apply --reject --whitespace=fix "$p" || ( echo "susfs patch failed: $p" && exit 6 )
@@ -157,7 +177,7 @@ jobs:
         cp $OUTDIR/.config $OUTDIR/.config.orig || true
         KBUILD_OUTPUT=$OUTDIR make ARCH=arm64 O=$OUTDIR olddefconfig || true
       shell: bash
-      working-directory: ${{ github.workspace }}
+      working-directory: ${{ env.KERNEL_DIR }}
 
     - name: Build kernel (clang via NDK)
       run: |
@@ -169,12 +189,12 @@ jobs:
         # Build. This will use the config merged above. Adjust defconfig name if needed.
         KBUILD_OUTPUT=$OUTDIR make -j$(nproc) ARCH=arm64 O=$OUTDIR CC=clang HOSTCC=gcc || ( echo "build failed" && exit 7 )
       shell: bash
-      working-directory: ${{ github.workspace }}
+      working-directory: ${{ env.KERNEL_DIR }}
 
     - name: Repack boot_patched.img
       run: |
-        chmod +x ./scripts/repack_boot.sh
-        ./scripts/repack_boot.sh --kernel $OUTDIR/arch/arm64/boot/Image --unpacked $OUTDIR/unpacked --out $OUTDIR/boot_patched.img
+        chmod +x $SCRIPTS_DIR/repack_boot.sh
+        $SCRIPTS_DIR/repack_boot.sh --kernel $OUTDIR/arch/arm64/boot/Image --unpacked $OUTDIR/unpacked --out $OUTDIR/boot_patched.img
         ls -lh $OUTDIR/boot_patched.img || true
       shell: bash
 
