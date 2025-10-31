@@ -1,0 +1,185 @@
+# GitHub Actions workflow to apply KernelSU-next + susfs and produce boot_patched.img
+# After adding this file, create a repository secret named BOOT_IMG_URL containing:
+# https://drive.proton.me/4a6ba468-eee8-4c3d-9099-fd194782b492
+#
+# Notes:
+# - This workflow attempts to integrate KernelSU "kernelsu-next" (tiann/KernelSU) and
+#   susfs from github.com/sidex15/susfs4ksu-module. It applies patches if they are
+#   present as patch files in the cloned repos. You may need to adapt the apply
+#   steps to the actual integration instructions of those projects.
+# - The helper scripts in scripts/ are minimal placeholders. For a robust pipeline,
+#   replace the unpack/repack/extract scripts with the kernel's scripts/extract-ikconfig
+#   and a proper mkbootimg implementation.
+name: build-kernelsu-next-susfs
+on:
+  workflow_dispatch:
+    inputs:
+      use_boot_url:
+        description: 'Provide boot image URL via secret BOOT_IMG_URL (true/false)'
+        required: true
+        default: 'true'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      REPO: 0xSoul24/kernel_google_msm-4.14
+      KERNEL_DIR: ${{ github.workspace }}
+      OUTDIR: ${{ github.workspace }}/out
+      NDK_VERSION: 'r25c'
+    steps:
+    - name: Checkout kernel repo
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y git bc bison flex libssl-dev libncurses5-dev libelf-dev device-tree-compiler python3 python3-pip unzip curl file pkg-config build-essential abootimg
+      shell: bash
+
+    - name: Download Android NDK
+      run: |
+        mkdir -p $HOME/android-ndk
+        NDK_TAR="android-ndk-${{ env.NDK_VERSION }}-linux.zip"
+        curl -sS -L "https://dl.google.com/android/repository/${NDK_TAR}" -o "${NDK_TAR}"
+        unzip -q "${NDK_TAR}" -d $HOME/android-ndk
+        echo "$HOME/android-ndk" > $HOME/ndk_root
+      shell: bash
+
+    - name: Setup tool env
+      run: |
+        export NDKROOT=$(ls -d $HOME/android-ndk/android-ndk-*)
+        echo "NDKROOT=$NDKROOT" >> $GITHUB_ENV
+        echo "$NDKROOT/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+      shell: bash
+
+    - name: Get KernelSU-next and susfs4ksu-module
+      run: |
+        # Clone KernelSU (kernelsu-next). If you want a specific fork/branch change URL below.
+        git clone --depth=1 https://github.com/tiann/KernelSU.git kernelsu-next || true
+        # Clone the susfs repo specified by you (sidex15/susfs4ksu-module)
+        git clone --depth=1 https://github.com/sidex15/susfs4ksu-module.git susfs4ksu-module || true
+        ls -la kernelsu-next susfs4ksu-module || true
+      shell: bash
+
+    - name: Prepare workspace
+      run: |
+        mkdir -p $OUTDIR
+        ls -la
+      shell: bash
+
+    - name: Obtain stock boot image
+      id: getboot
+      run: |
+        if [ "${{ github.event.inputs.use_boot_url }}" = "true" ]; then
+          if [ -z "${{ secrets.BOOT_IMG_URL }}" ]; then
+            echo "ERROR: BOOT_IMG_URL secret not set." >&2
+            exit 2
+          fi
+          echo "Downloading boot.img from secret URL..."
+          curl -fsSL "${{ secrets.BOOT_IMG_URL }}" -o $OUTDIR/boot.img
+        else
+          if [ -f "$KERNEL_DIR/boot.img" ]; then
+            cp "$KERNEL_DIR/boot.img" $OUTDIR/boot.img
+          else
+            echo "No boot.img found in repo root; set use_boot_url=true and secret BOOT_IMG_URL" >&2
+            exit 3
+          fi
+        fi
+        file $OUTDIR/boot.img
+      shell: bash
+
+    - name: Unpack boot image (minimal)
+      run: |
+        mkdir -p $OUTDIR/unpacked
+        python3 ./scripts/unpack_bootimg.py --input $OUTDIR/boot.img --outdir $OUTDIR/unpacked
+        ls -la $OUTDIR/unpacked
+      shell: bash
+
+    - name: Extract kernel config (best-effort)
+      run: |
+        # Attempt to use kernel script/extractor if present; fallback to placeholder
+        if [ -f scripts/extract-ikconfig ]; then
+          scripts/extract-ikconfig $OUTDIR/unpacked/* > $OUTDIR/.config || true
+        else
+          python3 ./scripts/extract_ikconfig.py $OUTDIR/unpacked/* > $OUTDIR/.config || true
+        fi
+        if [ ! -s $OUTDIR/.config ]; then
+          echo "No IKCONFIG found; falling back to device defconfig if present"
+          if [ -f arch/arm64/configs/flame_defconfig ]; then
+            cp arch/arm64/configs/flame_defconfig $OUTDIR/.config
+          elif [ -f arch/arm64/configs/flame-perf_defconfig ]; then
+            cp arch/arm64/configs/flame-perf_defconfig $OUTDIR/.config
+          else
+            echo "# fallback minimal config" > $OUTDIR/.config
+          fi
+        fi
+        echo "Config stored at $OUTDIR/.config"
+      shell: bash
+
+    - name: Apply KernelSU-next and susfs patches (attempt)
+      run: |
+        set -e
+        # Attempt to apply KernelSU patches if present in kernelsu-next/patches or kernelsu-next/patch
+        if [ -d kernelsu-next/patches ]; then
+          echo "Applying KernelSU patches from kernelsu-next/patches..."
+          for p in kernelsu-next/patches/*.patch; do
+            [ -e "$p" ] || continue
+            echo "Applying $p"
+            git apply --reject --whitespace=fix "$p" || ( echo "kernelsu patch failed: $p" && exit 5 )
+          done
+        else
+          echo "kernelsu-next/patches not found; check the KernelSU repo layout and integration docs"
+        fi
+
+        # Apply susfs patch if provided in susfs4ksu-module repository
+        if [ -f susfs4ksu-module/susfs.patch ]; then
+          echo "Applying susfs4ksu-module/susfs.patch"
+          git apply --reject --whitespace=fix susfs4ksu-module/susfs.patch || ( echo "susfs patch failed" && exit 6 )
+        else
+          echo "No susfs.patch found in susfs4ksu-module; checking for patch files..."
+          for p in susfs4ksu-module/*.patch; do
+            [ -e "$p" ] || continue
+            echo "Applying $p"
+            git apply --reject --whitespace=fix "$p" || ( echo "susfs patch failed: $p" && exit 6 )
+          done
+        fi
+
+        # If KernelSU requires copying files (e.g., include/*, fs/*), the user must adapt
+        echo "Patch apply step completed (best-effort). Inspect the repo to resolve any conflicts."
+        git status --porcelain || true
+      shell: bash
+
+    - name: Merge config and prepare build
+      run: |
+        cp $OUTDIR/.config $OUTDIR/.config.orig || true
+        KBUILD_OUTPUT=$OUTDIR make ARCH=arm64 O=$OUTDIR olddefconfig || true
+      shell: bash
+      working-directory: ${{ github.workspace }}
+
+    - name: Build kernel (clang via NDK)
+      run: |
+        export NDKROOT=$(ls -d $HOME/android-ndk/android-ndk-*)
+        export PATH=$NDKROOT/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
+        export ARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-android-
+        export CC=clang
+        # Build. This will use the config merged above. Adjust defconfig name if needed.
+        KBUILD_OUTPUT=$OUTDIR make -j$(nproc) ARCH=arm64 O=$OUTDIR CC=clang HOSTCC=gcc || ( echo "build failed" && exit 7 )
+      shell: bash
+      working-directory: ${{ github.workspace }}
+
+    - name: Repack boot_patched.img
+      run: |
+        chmod +x ./scripts/repack_boot.sh
+        ./scripts/repack_boot.sh --kernel $OUTDIR/arch/arm64/boot/Image --unpacked $OUTDIR/unpacked --out $OUTDIR/boot_patched.img
+        ls -lh $OUTDIR/boot_patched.img || true
+      shell: bash
+
+    - name: Upload boot_patched.img artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: boot_patched_img
+        path: ${{ github.workspace }}/out/boot_patched.img
