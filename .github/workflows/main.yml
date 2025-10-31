@@ -1,6 +1,6 @@
 # GitHub Actions workflow to apply KernelSU-next + susfs and produce boot_patched.img
 # After adding this file, create a repository secret named BOOT_IMG_URL containing:
-# https://drive.proton.me/4a6ba468-eee8-4c3d-9099-fd194782b492
+# https://github.com/t352-group/p4_project/blob/main/boot.img
 #
 # Notes:
 # - This workflow attempts to integrate KernelSU "kernelsu-next" (tiann/KernelSU) and
