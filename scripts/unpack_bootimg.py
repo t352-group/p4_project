@@ -48,8 +48,14 @@ class BootImageHeader:
         if magic != self.BOOT_MAGIC:
             raise ValueError(f"Invalid boot magic: {magic}")
         
-        # Parse header fields
-        fmt = '<10I16s512s32s1024sIQI'
+        # Parse header fields for Android boot image header v0/v1/v2
+        # Format: magic(8) + kernel_size(4) + kernel_addr(4) + ramdisk_size(4) + 
+        #         ramdisk_addr(4) + second_size(4) + second_addr(4) + tags_addr(4) + 
+        #         page_size(4) + header_version(4) + os_version(4) + name(16) + 
+        #         cmdline(512) + id(32) + extra_cmdline(1024) + recovery_dtbo_size(4) + 
+        #         recovery_dtbo_offset(8) + header_size(4)
+        # Note: dt_size is in earlier versions at offset where header_version would be
+        fmt = '<11I16s512s32s1024sIQI'
         fields = struct.unpack(fmt, data[8:1632])
         
         self.kernel_size = fields[0]
@@ -60,7 +66,9 @@ class BootImageHeader:
         self.second_addr = fields[5]
         self.tags_addr = fields[6]
         self.page_size = fields[7]
-        self.header_version = fields[8]
+        # Field 8 can be dt_size (header v0) or header_version (header v1+)
+        self.dt_size = fields[8]  # or header_version in v1+
+        self.header_version = fields[8]  # Same field, different interpretation
         self.os_version = fields[9]
         self.name = fields[10]
         self.cmdline = fields[11]

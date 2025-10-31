@@ -166,7 +166,9 @@ else
     if [ -z "$MKBOOTIMG_PY" ]; then
         # Create a minimal Python-based mkbootimg implementation
         echo "Creating boot image using Python implementation..."
-        python3 - "$KERNEL" "$RAMDISK" "$OUTPUT" "$page_size" "$kernel_addr" "$ramdisk_addr" "$tags_addr" "$cmdline" <<'PYEOF'
+        # Use empty string as default for cmdline if not set
+        CMDLINE_ARG="${cmdline:-}"
+        python3 - "$KERNEL" "$RAMDISK" "$OUTPUT" "$page_size" "$kernel_addr" "$ramdisk_addr" "$tags_addr" "$CMDLINE_ARG" <<'PYEOF'
 import sys
 import struct
 import os
@@ -185,7 +187,7 @@ page_size = int(sys.argv[4])
 kernel_addr = int(sys.argv[5], 16) if sys.argv[5].startswith('0x') else int(sys.argv[5])
 ramdisk_addr = int(sys.argv[6], 16) if sys.argv[6].startswith('0x') else int(sys.argv[6])
 tags_addr = int(sys.argv[7], 16) if sys.argv[7].startswith('0x') else int(sys.argv[7])
-cmdline = sys.argv[8].encode('utf-8') if len(sys.argv) > 8 else b''
+cmdline = sys.argv[8].encode('utf-8') if len(sys.argv) > 8 and sys.argv[8] else b''
 
 # Read kernel and ramdisk
 with open(kernel_path, 'rb') as f:
@@ -201,15 +203,15 @@ second_size = 0
 second_addr = 0
 dt_size = 0
 
-# Build header
+# Build header (format matches the unpack format)
 header = struct.pack(
-    '<8s10I16s512s32s1024sIQI',
+    '<8s11I16s512s32s1024sIQI',
     magic,
     kernel_size, kernel_addr,
     ramdisk_size, ramdisk_addr,
     second_size, second_addr,
     tags_addr, page_size,
-    0,  # header_version
+    0,  # dt_size/header_version
     0,  # os_version
     b'',  # name
     cmdline + b'\x00' * (512 - len(cmdline)),
