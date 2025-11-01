@@ -12,7 +12,6 @@ jobs:
     env:
       REPO: 0xSoul24/kernel_google_msm-4.14
       KERNEL_DIR: ${{ github.workspace }}/kernel
-      SCRIPTS_DIR: ${{ github.workspace }}/scripts
       OUTDIR: ${{ github.workspace }}/out
       NDK_VERSION: "r25c"
 
@@ -22,14 +21,21 @@ jobs:
         with:
           lfs: true
 
-      - name: Install dependencies
+      - name: Install build dependencies (incl. cross toolchains) and magiskboot
         shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
             git bc bison flex libssl-dev libncurses5-dev libelf-dev \
             device-tree-compiler python3 python3-pip unzip curl file \
-            pkg-config build-essential abootimg
+            pkg-config build-essential abootimg \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi lz4 cpio
+          # Install magiskboot (for modern boot images, unpack/repack)
+          sudo curl -sSL -o /usr/local/bin/magiskboot \
+            https://github.com/topjohnwu/Magisk/releases/latest/download/magiskboot
+          sudo chmod +x /usr/local/bin/magiskboot
+          magiskboot --help >/dev/null || { echo "magiskboot not installed correctly"; exit 1; }
 
       - name: Download Android NDK
         shell: bash
@@ -71,13 +77,6 @@ jobs:
           mkdir -p "$OUTDIR"
           ls -la
 
-      - name: Make scripts executable
-        shell: bash
-        run: |
-          set -euo pipefail
-          chmod +x "$SCRIPTS_DIR"/*.py "$SCRIPTS_DIR"/*.sh || true
-          ls -la "$SCRIPTS_DIR" || true
-
       - name: Obtain stock boot image (repo-root only)
         id: getboot
         shell: bash
@@ -101,34 +100,27 @@ jobs:
             exit 4
           fi
 
-      - name: Unpack boot image
+      - name: Unpack boot image (magiskboot first, abootimg fallback)
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$OUTDIR/unpacked"
-          python3 "$SCRIPTS_DIR/unpack_bootimg.py" --input "$OUTDIR/boot.img" --outdir "$OUTDIR/unpacked"
-          ls -la "$OUTDIR/unpacked" || true
-
-      - name: Extract kernel config (best-effort)
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -f "$KERNEL_DIR/scripts/extract-ikconfig" ]; then
-            "$KERNEL_DIR/scripts/extract-ikconfig" "$OUTDIR/unpacked/"* > "$OUTDIR/.config" || true
+          UNP="$OUTDIR/unpacked"
+          rm -rf "$UNP"; mkdir -p "$UNP"
+          # Try magiskboot (modern header v3+)
+          if magiskboot unpack "$OUTDIR/boot.img" -o "$UNP" >/dev/null 2>&1; then
+            echo "Unpacked with magiskboot into $UNP"
           else
-            python3 "$SCRIPTS_DIR/extract_ikconfig.py" "$OUTDIR/unpacked/"* > "$OUTDIR/.config" || true
-          fi
-          if [ ! -s "$OUTDIR/.config" ]; then
-            echo "No IKCONFIG found; falling back to device defconfig if present"
-            if [ -f "$KERNEL_DIR/arch/arm64/configs/flame_defconfig" ]; then
-              cp "$KERNEL_DIR/arch/arm64/configs/flame_defconfig" "$OUTDIR/.config"
-            elif [ -f "$KERNEL_DIR/arch/arm64/configs/flame-perf_defconfig" ]; then
-              cp "$KERNEL_DIR/arch/arm64/configs/flame-perf_defconfig" "$OUTDIR/.config"
+            echo "magiskboot unpack failed, trying abootimg..."
+            pushd "$UNP" >/dev/null
+            if abootimg -x "$OUTDIR/boot.img"; then
+              echo "Unpacked with abootimg into $UNP"
             else
-              echo "# fallback minimal config" > "$OUTDIR/.config"
+              echo "ERROR: Failed to unpack boot image with magiskboot and abootimg" >&2
+              exit 7
             fi
+            popd >/dev/null
           fi
-          echo "Config stored at $OUTDIR/.config"
+          ls -la "$UNP" || true
 
       - name: Apply KernelSU-next patches (best-effort)
         shell: bash
@@ -146,7 +138,7 @@ jobs:
             echo "kernelsu-next/patches not found; skipping KernelSU patch application"
           fi
 
-      - name: Build kernel
+      - name: Build kernel (fix CLANG_TRIPLE error)
         shell: bash
         run: |
           set -euo pipefail
@@ -161,8 +153,13 @@ jobs:
           export CC=clang
           export LLVM=1
           export LLVM_IAS=1
+          # Android Clang detected by kernel -> provide GNU binutils triple
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          # Android NDK cross prefixes
           export CROSS_COMPILE=aarch64-linux-android-
           export CROSS_COMPILE_ARM32=arm-linux-androideabi-
+          # Provide compat GNU triple so Makefile is happy when needed
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
 
           KOUT="$OUTDIR/kernel_out"
           mkdir -p "$KOUT"
@@ -172,17 +169,18 @@ jobs:
             DEFCONFIG="flame_defconfig"
           elif [ -f "$KERNEL_DIR/arch/arm64/configs/flame-perf_defconfig" ]; then
             DEFCONFIG="flame-perf_defconfig"
+          elif [ -f "$KERNEL_DIR/arch/arm64/configs/defconfig" ]; then
+            DEFCONFIG="defconfig"
           else
             DEFCONFIG=""
-            echo "WARNING: flame(_perf)_defconfig not found; attempting olddefconfig with extracted .config"
+            echo "WARNING: flame(_perf)_defconfig not found; using generic defconfig"
           fi
 
           pushd "$KERNEL_DIR" >/dev/null
           if [ -n "$DEFCONFIG" ]; then
             make O="$KOUT" ARCH=arm64 "$DEFCONFIG" -j"$(nproc)"
           else
-            cp "$OUTDIR/.config" "$KOUT/.config" || true
-            make O="$KOUT" ARCH=arm64 olddefconfig -j"$(nproc)" || true
+            make O="$KOUT" ARCH=arm64 defconfig -j"$(nproc)"
           fi
 
           make O="$KOUT" ARCH=arm64 -j"$(nproc)"
@@ -207,12 +205,65 @@ jobs:
           echo "KERNEL_IMG=$KERNEL_IMG" >> "$GITHUB_ENV"
           echo "Using built kernel image: $KERNEL_IMG"
 
-      - name: Repack boot image with new kernel
+      - name: Repack boot image with new kernel (magiskboot first, abootimg fallback)
         shell: bash
         run: |
           set -euo pipefail
           PATCHED_BOOT="$OUTDIR/boot_patched.img"
-          bash "$SCRIPTS_DIR/repack_boot.sh" --orig "$OUTDIR/boot.img" --kernel "$KERNEL_IMG" --out "$PATCHED_BOOT"
+          TMP=$(mktemp -d)
+          cleanup() { rm -rf "$TMP"; }
+          trap cleanup EXIT
+
+          # Try magiskboot repack (modern)
+          if magiskboot unpack "$OUTDIR/boot.img" -o "$TMP" >/dev/null 2>&1; then
+            cp -f "$KERNEL_IMG" "$TMP/kernel"
+            if magiskboot repack "$OUTDIR/boot.img" -o "$TMP/new-boot.img" >/dev/null 2>&1 && [ -f "$TMP/new-boot.img" ]; then
+              mv -f "$TMP/new-boot.img" "$PATCHED_BOOT"
+              echo "Repacked with magiskboot: $PATCHED_BOOT"
+            else
+              echo "magiskboot repack failed, trying abootimg..." >&2
+              # Fallback to abootimg
+              rm -rf "$TMP"; mkdir -p "$TMP"; pushd "$TMP" >/dev/null
+              if abootimg -x "$OUTDIR/boot.img"; then
+                RAMDISK=""
+                for r in initrd.img ramdisk.img ramdisk.cpio.gz initramfs.cpio.gz; do
+                  [ -f "$r" ] && RAMDISK="$r" && break
+                done
+                if [ -f bootimg.cfg ] && [ -n "$RAMDISK" ]; then
+                  abootimg --create "$PATCHED_BOOT" -f bootimg.cfg -k "$KERNEL_IMG" -r "$RAMDISK"
+                  echo "Repacked with abootimg: $PATCHED_BOOT"
+                else
+                  echo "ERROR: abootimg fallback failed to find ramdisk/cfg" >&2
+                  exit 8
+                fi
+              else
+                echo "ERROR: abootimg fallback failed to unpack original image" >&2
+                exit 9
+              fi
+              popd >/dev/null
+            fi
+          else
+            echo "magiskboot unpack failed; attempting abootimg direct repack..." >&2
+            pushd "$TMP" >/dev/null
+            if abootimg -x "$OUTDIR/boot.img"; then
+              RAMDISK=""
+              for r in initrd.img ramdisk.img ramdisk.cpio.gz initramfs.cpio.gz; do
+                [ -f "$r" ] && RAMDISK="$r" && break
+              done
+              if [ -f bootimg.cfg ] && [ -n "$RAMDISK" ]; then
+                abootimg --create "$PATCHED_BOOT" -f bootimg.cfg -k "$KERNEL_IMG" -r "$RAMDISK"
+                echo "Repacked with abootimg: $PATCHED_BOOT"
+              else
+                echo "ERROR: abootimg fallback failed to find ramdisk/cfg" >&2
+                exit 8
+              fi
+            else
+              echo "ERROR: Could not repack boot image with magiskboot or abootimg" >&2
+              exit 5
+            fi
+            popd >/dev/null
+          fi
+
           ls -la "$PATCHED_BOOT" || true
 
       - name: Upload patched boot image
