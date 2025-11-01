@@ -22,7 +22,7 @@ if [[ ! -f "$BOOT_LOCAL" ]]; then
   echo "ERROR: boot.img not found at repository root: $BOOT_LOCAL" >&2
   exit 2
 fi
-cp "$BOOT_LOCAL" "$OUTDIR/boot.img"
+cp -f "$BOOT_LOCAL" "$OUTDIR/boot.img"
 echo "Using local boot image: $OUTDIR/boot.img"
 file "$OUTDIR/boot.img" || true
 
@@ -50,7 +50,7 @@ if [[ ! -s "$CONFIG_OUT" ]]; then
 fi
 echo "Config stored at $CONFIG_OUT"
 
-# 4) Apply KernelSU and SUSFS patches (best-effort; fail if KernelSU patching fails)
+# 4) Apply KernelSU patches (best-effort; fail on patch errors)
 pushd "$KERNEL_DIR" >/dev/null
 if [[ -d "$WORKSPACE/kernelsu-next/patches" ]]; then
   echo "Applying KernelSU patches from kernelsu-next/patches..."
@@ -63,8 +63,7 @@ else
   echo "kernelsu-next/patches not found; skipping KernelSU patch application"
 fi
 
-# SUSFS integration is repo-specific; keep as a no-op unless you have patches to apply
-# Example (uncomment and adjust if you have patch files):
+# SUSFS integration placeholder (uncomment and adapt if you have patches)
 # if [[ -d "$WORKSPACE/susfs4ksu-module/patches" ]]; then
 #   echo "Applying SUSFS patches..."
 #   for p in "$WORKSPACE"/susfs4ksu-module/patches/*.patch; do
@@ -99,7 +98,7 @@ if [[ -f "$KERNEL_DIR/arch/arm64/configs/flame_defconfig" ]]; then
 elif [[ -f "$KERNEL_DIR/arch/arm64/configs/flame-perf_defconfig" ]]; then
   DEFCONFIG="flame-perf_defconfig"
 else
-  echo "WARNING: flame(_perf)_defconfig not found, attempting defconfig from extracted .config"
+  echo "WARNING: flame(_perf)_defconfig not found, attempting olddefconfig with extracted .config"
   DEFCONFIG=""
 fi
 
@@ -107,7 +106,6 @@ pushd "$KERNEL_DIR" >/dev/null
 if [[ -n "$DEFCONFIG" ]]; then
   make O="$KOUT" ARCH=arm64 "$DEFCONFIG" -j"$(nproc)"
 else
-  # Attempt olddefconfig from $CONFIG_OUT if we have one
   cp "$CONFIG_OUT" "$KOUT/.config" || true
   make O="$KOUT" ARCH=arm64 olddefconfig -j"$(nproc)" || true
 fi
