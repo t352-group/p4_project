@@ -1,0 +1,82 @@
+name: build-kernelsu-next-susfs
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      REPO: 0xSoul24/kernel_google_msm-4.14
+      KERNEL_DIR: ${{ github.workspace }}/kernel
+      SCRIPTS_DIR: ${{ github.workspace }}/scripts
+      OUTDIR: ${{ github.workspace }}/out
+      NDK_VERSION: "r25c"
+    steps:
+      - name: Checkout repository (with LFS for large binaries)
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git bc bison flex libssl-dev libncurses5-dev libelf-dev \
+            device-tree-compiler python3 python3-pip unzip curl file \
+            pkg-config build-essential abootimg
+
+      - name: Download Android NDK
+        shell: bash
+        run: |
+          mkdir -p "$HOME/android-ndk"
+          NDK_TAR="android-ndk-${NDK_VERSION}-linux.zip"
+          curl -sS -L "https://dl.google.com/android/repository/${NDK_TAR}" -o "${NDK_TAR}"
+          unzip -q "${NDK_TAR}" -d "$HOME/android-ndk"
+          echo "$(ls -d $HOME/android-ndk/android-ndk-*)" > "$HOME/ndk_root"
+
+      - name: Setup NDK env
+        shell: bash
+        run: |
+          export NDKROOT="$(cat "$HOME/ndk_root")"
+          echo "NDKROOT=$NDKROOT" >> "$GITHUB_ENV"
+          echo "$NDKROOT/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.REPO }}
+          path: kernel
+          fetch-depth: 0
+
+      - name: Get KernelSU-next and SUSFS modules
+        shell: bash
+        run: |
+          set -e
+          git clone --depth=1 https://github.com/tiann/KernelSU.git kernelsu-next || true
+          git clone --depth=1 https://github.com/sidex15/susfs4ksu-module.git susfs4ksu-module || true
+          ls -la kernelsu-next susfs4ksu-module || true
+
+      - name: Make scripts executable
+        shell: bash
+        run: |
+          chmod +x scripts/*.py scripts/*.sh || true
+
+      - name: Build end-to-end (uses repo-root boot.img only)
+        shell: bash
+        env:
+          NDKROOT: ${{ env.NDKROOT }}
+        run: |
+          bash "$SCRIPTS_DIR/build.sh"
+
+      - name: Upload patched boot image
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot_patched.img
+          path: ${{ env.OUTDIR }}/boot_patched.img
+          if-no-files-found: error
