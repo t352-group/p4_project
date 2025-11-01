@@ -16,8 +16,8 @@ on:
     inputs:
       use_boot_url:
         description: 'Provide boot image URL via secret BOOT_IMG_URL (true/false)'
-        required: true
-        default: 'true'
+        required: false
+        default: 'false'
 
 jobs:
   build:
